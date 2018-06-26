@@ -1,0 +1,17 @@
+---
+documentation:
+  description: Special recipe for cmorizing observational dataset.
+  authors:
+    - righ_ma
+  references: null
+  projects: null
+
+preprocessors:
+  preprocessor: {}
+
+diagnostics:
+  cmorize_obs:
+    description: Stand-alone cmorization scripts for observational dataset
+    scripts:
+      AURA-TES:
+        script: ../cmor/cmorize_obs/cmorize_obs_AURA-TES.ncl

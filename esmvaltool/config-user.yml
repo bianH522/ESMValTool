@@ -33,6 +33,8 @@ rootpath:
   CMIP5: ~/esmvaltool_input
   # Rootpath to OBS data
   OBS: ~/esmvaltool_input
+  # Rootpath to raw OBS data (to be cmorized)
+  RAWOBS: ~/esmvaltool_input
   # Default
   default: ~/esmvaltool_input
 
