@@ -6,8 +6,8 @@ documentation:
   references: null
   projects: null
 
-preprocessors:
-  preprocessor: {}
+#preprocessors:
+#  preprocessor: {}
 
 diagnostics:
   cmorize_obs:
