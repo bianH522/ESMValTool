@@ -3,6 +3,8 @@ import logging
 import os
 
 from iris.cube import Cube
+from prov.dot import prov_to_dot
+from prov.model import ProvDocument
 
 from .._task import BaseTask
 from ._area_pp import area_average as average_region
@@ -178,6 +180,10 @@ def preprocess_multi_model(input_files, all_settings, order, debug=False):
     """Run preprocessor on multiple models for a single variable."""
     # Group input files by output file
     all_items = _group_input(input_files, all_settings)
+    doc = ProvDocument()
+    doc.add_namespace('evt', 'http://www.esmvaltool.org/scheme')
+    for name in all_items:
+        all_items[name] = ProductList.from_files(all_items[name], doc)
     logger.debug("Processing %s", all_items)
 
     # List of all preprocessor steps used
@@ -206,53 +212,140 @@ def preprocess_multi_model(input_files, all_settings, order, debug=False):
                                          debug)
         if step is not dummy_step:
             # Run multi model step
-            multi_model_items = [
-                item for name in all_items for item in all_items[name]
-            ]
+            multi_model_items = ProductList(
+                [item for name in all_items for item in all_items[name]], doc)
             all_items = {}
             result = preprocess(multi_model_items, multi_model_settings, order,
                                 debug)
-            for item in result:
-                if isinstance(item, Cube):
-                    name = item.attributes['_filename']
+            for product in result:
+                if isinstance(product.data, Cube):
+                    name = product.data.attributes['_filename']
                     if name not in all_items:
-                        all_items[name] = []
-                    all_items[name].append(item)
+                        all_items[name] = ProductList([], doc)
+                    all_items[name].append(product)
                 else:
-                    all_items[item] = [item]
+                    all_items[product.data] = ProductList([product], doc)
+    filenames = [
+        product.data for name in all_items for product in all_items[name]
+    ]
+    return filenames, doc
 
-    return [filename for name in all_items for filename in all_items[name]]
 
-
-def preprocess(items, settings, order, debug=False):
+def preprocess(products, settings, order, debug=False):
     """Run preprocessor"""
     steps = (step for step in order if step in settings)
     for step in steps:
         logger.debug("Running preprocessor step %s", step)
-        function = globals()[step]
-        args = settings[step]
-
-        if step in _LIST_INPUT_FUNCTIONS:
-            logger.debug("Running %s(%s, %s)", function.__name__, items, args)
-            result = [function(items, **args)]
-        else:
-            result = []
-            for item in items:
-                logger.debug("Running %s(%s, %s)", function.__name__, item,
-                             args)
-                result.append(function(item, **args))
-
-        if step in _LIST_OUTPUT_FUNCTIONS:
-            items = tuple(item for subitem in result for item in subitem)
-        else:
-            items = tuple(result)
+        products = products.apply(step, settings[step])
 
         if debug:
+            items = [p.data for p in products]
             logger.debug("Result %s", items)
             cubes = [item for item in items if isinstance(item, Cube)]
             save(cubes, debug=debug, step=step)
 
-    return items
+    return products
+
+
+def write_provenance(provenance, output_dir):
+    """Write provenance information to output_dir."""
+    filename = os.path.join(output_dir, 'provenance')
+    logger.info("Writing provenance to %s.xml", filename)
+    provenance.serialize(filename + '.xml', format='xml')
+
+    graph = prov_to_dot(provenance)
+    logger.info("Writing provenance to %s.png", filename)
+    graph.write_png(filename + '.png')
+    logger.info("Writing provenance to %s.pdf", filename)
+    graph.write_pdf(filename + '.pdf')
+
+
+class Product(object):
+    def __init__(self, data, entity, doc):
+        self.data = data
+        self.entity = entity
+        self._doc = doc
+
+    @classmethod
+    def from_file(cls, filename, doc):
+        entity = doc.entity('evt:' + filename)
+        return cls(filename, entity, doc)
+
+    def apply(self, step, args):
+
+        # Do the computation
+        function = globals()[step]
+        logger.debug("Running %s(%s, %s)", function.__name__, self.data, args)
+        result = function(self.data, **args)
+        if step not in _LIST_OUTPUT_FUNCTIONS:
+            result = [result]
+
+        # Track provenance
+        args = {'evt:' + k: str(v) for k, v in args.items()}
+        activity = self._doc.activity(
+            'evt:' + step + ':' + str(self), other_attributes=args)
+        products = []
+        for item in result:
+            entity = self._doc.entity('evt:' + str(self) + ';' + step)
+            entity.wasDerivedFrom(self.entity, activity)
+            products.append(Product(item, entity, self._doc))
+
+        return products
+
+    def __str__(self):
+        return str(self.entity.identifier)[4:]
+
+
+class ProductList(object):
+    def __init__(self, products, doc):
+        self.products = products
+        self._doc = doc
+        self.entity = doc.collection('evt:' + '+'.join(
+            str(p) for p in products))
+        for product in self.products:
+            self.entity.hadMember(product.entity)
+
+    @classmethod
+    def from_files(cls, filenames, doc):
+        products = [Product.from_file(f, doc) for f in filenames]
+        return cls(products, doc)
+
+    def apply(self, step, args):
+
+        products = []
+        if step not in _LIST_INPUT_FUNCTIONS:
+            for product in self.products:
+                products.extend(product.apply(step, args))
+        else:
+            # Do the computation
+            function = globals()[step]
+            items = [p.data for p in self.products]
+            logger.debug("Running %s(%s, %s)", function.__name__, items, args)
+            result = function(items, **args)
+            if step not in _LIST_OUTPUT_FUNCTIONS:
+                result = [result]
+
+            # Track provenance
+            args = {'evt:' + k: str(v) for k, v in args.items()}
+            name = str(self.entity.identifier)[4:]
+            activity = self._doc.activity(
+                'evt:' + step + ':' + name, other_attributes=args)
+            for i, item in enumerate(result):
+                entity = self._doc.entity('evt:' + name + ';' + step + '-' +
+                                          str(i))
+                entity.wasDerivedFrom(self.entity, activity)
+                products.append(Product(item, entity, self._doc))
+
+        return ProductList(products, self._doc)
+
+    def append(self, value):
+        self.products.append(value)
+
+    def __iter__(self):
+        return iter(self.products)
+
+    def __str__(self):
+        return '[' + '\n'.join(str(p) for p in self.products) + ']'
 
 
 class PreprocessingTask(BaseTask):
@@ -274,11 +367,12 @@ class PreprocessingTask(BaseTask):
 
     def _run(self, input_files):
         # If input_data is not available from ancestors and also not
-        # specified in self.run(input_data), use default
+        # specified in self.run(input_files), use default
         if not self.ancestors and not input_files:
             input_files = self._input_files
-        output_files = preprocess_multi_model(
+        output_files, provenance = preprocess_multi_model(
             input_files, self.settings, self.order, debug=self.debug)
+        write_provenance(provenance, self.output_dir)
         return output_files
 
     def __str__(self):
